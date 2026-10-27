@@ -1,0 +1,18 @@
+# XcodeGen output — regenerate with `xcodegen generate`
+Yap.xcodeproj/
+
+.DS_Store
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# XcodeGen-generated
+Yap/Info.plist
+
+# API keys — never commit. See Yap/AI/Secrets.swift.example for local setup.
+Yap/AI/Secrets.swift
+
+# Generated analysis output and screenshots from the superseded interface.
+graphify-out/
+screenshots/
