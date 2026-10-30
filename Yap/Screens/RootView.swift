@@ -1,127 +1,206 @@
 import SwiftUI
+import UIKit
 
 struct RootView: View {
-    @EnvironmentObject var store: Store
-    @Environment(\.colorScheme) private var colorScheme
-    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    private var theme: Theme {
-        Theme(dark: colorScheme == .dark, highContrast: colorSchemeContrast == .increased)
-    }
+    @EnvironmentObject private var store: Store
+    @EnvironmentObject private var prefs: Preferences
+    @EnvironmentObject private var lock: AppLock
+    @Environment(\.scenePhase) private var scenePhase
+    @Namespace private var zoom
 
     var body: some View {
-        GeometryReader { geometry in
+        GeometryReader { geo in
+            let insets = geo.safeAreaInsets
+            // The window's own insets leave the keyboard out, unlike the proxy's.
+            let window = Self.windowInsets ?? UIEdgeInsets(top: insets.top, left: 0, bottom: insets.bottom, right: 0)
+            let metrics = ScreenMetrics(
+                size: CGSize(width: geo.size.width + insets.leading + insets.trailing, height: geo.size.height + insets.top + insets.bottom),
+                safeTop: window.top,
+                safeBottom: window.bottom
+            )
             ZStack {
-                NavigationStack {
-                    VStack(spacing: 0) {
-                        header
-                            .padding(.horizontal, 22)
-                            .padding(.top, 12)
-                            .padding(.bottom, 18)
-
-                        Picker("Journal section", selection: $store.segment) {
-                            Text("Journal").tag(Segment.dashboard)
-                            Text("Patterns").tag(Segment.insights)
-                        }
-                        .pickerStyle(.segmented)
-                        .tint(theme.accent)
-                        .padding(.horizontal, 20)
-                        .padding(.bottom, 8)
-
-                        ScrollView(.vertical) {
-                            Group {
-                                if store.segment == .dashboard {
-                                    DashboardView(theme: theme)
-                                } else {
-                                    InsightsView(theme: theme)
-                                }
-                            }
-                            .padding(.horizontal, 22)
-                            .padding(.top, 8)
-                            .padding(.bottom, 20)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .safeAreaInset(edge: .bottom, spacing: 0) {
-                            recordAction
-                        }
+                Group {
+                    if prefs.onboarded {
+                        mainStack
+                            .transition(.asymmetric(insertion: .opacity.combined(with: .scale(scale: 0.985)), removal: .opacity))
+                    } else {
+                        OnboardingFlow()
+                            .transition(.opacity)
                     }
-                    .background(theme.bg.ignoresSafeArea())
-                    .navigationDestination(isPresented: detailIsPresented) {
-                        DetailView(theme: theme)
-                    }
-                    .toolbar(.hidden, for: .navigationBar)
                 }
-                .accessibilityHidden(store.recordingOpen)
+                // The page behind the recorder sinks back while the recorder grows over it.
+                .scaleEffect(store.recording == nil ? 1 : 0.94)
+                .brightness(store.recording == nil ? 0 : -0.08)
+                .accessibilityHidden(store.recording != nil)
 
-                RecordingView(transcriber: store.transcriber, theme: theme)
-                    .offset(y: store.recordingOpen ? 0 : geometry.size.height)
-                    .opacity(store.recordingOpen ? 1 : 0)
-                    .animation(
-                        reduceMotion ? nil : .timingCurve(0.32, 0.72, 0, 1, duration: 0.4),
-                        value: store.recordingOpen
-                    )
-                    .allowsHitTesting(store.recordingOpen)
-                    .accessibilityHidden(!store.recordingOpen)
+                if let session = store.recording {
+                    RecordingView(transcriber: store.transcriber, session: session)
+                        .transition(recorderTransition(session.origin))
+                        .zIndex(10)
+                }
+
+                ToastOverlay(toast: store.toast, safeTop: metrics.safeTop)
+                    .ignoresSafeArea()
+                    .zIndex(30)
+
+                if lock.isLocked {
+                    LockScreen()
+                        .transition(.opacity)
+                        .zIndex(40)
+                }
+
+                if prefs.hideInSwitcher && prefs.onboarded && scenePhase != .active && !lock.isLocked && !store.systemPromptActive {
+                    PrivacyCover()
+                        .zIndex(50)
+                }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .environment(\.screen, metrics)
         }
-        .alert("Microphone access needed", isPresented: $store.micDenied) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text("Allow microphone access in Settings so Yap can transcribe your entries on-device.")
+        .background(Palette.screen.ignoresSafeArea())
+        .alert(store.alert?.title ?? "", isPresented: alertShown, presenting: store.alert) { alert in
+            ForEach(alert.actions.indices, id: \.self) { i in
+                let action = alert.actions[i]
+                Button(action.label, role: action.role) {
+                    store.alert = nil
+                    DispatchQueue.main.async { action.run() }
+                }
+            }
+        } message: { alert in
+            Text(alert.message)
         }
-        .alert("Couldn't start transcription", isPresented: Binding(
-            get: { store.transcriberError != nil },
-            set: { if !$0 { store.transcriberError = nil } }
-        )) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(store.transcriberError ?? "")
+        .onChange(of: scenePhase) { _, phase in
+            switch phase {
+            case .background:
+                store.player.pause()
+                if prefs.lockEnabled && prefs.onboarded { lock.lock() }
+            case .active:
+                if lock.isLocked { lock.unlock() }
+            default:
+                break
+            }
         }
     }
 
-    private var detailIsPresented: Binding<Bool> {
-        Binding(
-            get: { store.detailEntry != nil },
-            set: { isPresented in
-                if !isPresented, store.detailEntry != nil {
-                    store.closeDetail()
+    private static var windowInsets: UIEdgeInsets? {
+        UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap(\.windows)
+            .first(where: \.isKeyWindow)?
+            .safeAreaInsets
+    }
+
+    private var alertShown: Binding<Bool> {
+        Binding(get: { store.alert != nil }, set: { if !$0 { store.alert = nil } })
+    }
+
+    private var mainStack: some View {
+        NavigationStack(path: $store.path) {
+            TabsRoot(zoom: zoom)
+                .toolbar(.hidden, for: .navigationBar)
+                .navigationDestination(for: Route.self) { route in
+                    switch route {
+                    case .reading(let id, let zoomed):
+                        if zoomed {
+                            ReadingView(id: id, player: store.player)
+                                .navigationTransition(.zoom(sourceID: id, in: zoom))
+                        } else {
+                            ReadingView(id: id, player: store.player)
+                        }
+                    case .writing:
+                        WritingView()
+                    }
                 }
-            }
+        }
+    }
+
+    /// Opens as a circle growing from the record button; leaves either by shrinking back
+    /// into it (discarded) or by lifting away to reveal the draft (saved).
+    private func recorderTransition(_ origin: CGPoint) -> AnyTransition {
+        let reveal = AnyTransition.modifier(
+            active: CircleReveal(radius: 31, center: origin),
+            identity: CircleReveal(radius: 1100, center: origin)
         )
+        switch store.recordingExit {
+        case .settle:
+            return .asymmetric(insertion: reveal, removal: .opacity.combined(with: .offset(y: -16)))
+        case .unreveal:
+            return .asymmetric(insertion: reveal, removal: reveal.combined(with: .opacity))
+        }
     }
+}
 
-    private var header: some View {
-        HStack(alignment: .center, spacing: 16) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Yap")
-                    .font(.system(.largeTitle, design: .rounded).weight(.bold))
-                    .foregroundStyle(theme.textPrimary)
-                Text(Date.now.formatted(.dateTime.weekday(.wide).month(.wide).day()))
-                    .font(.subheadline)
-                    .foregroundStyle(theme.textSecondary)
+/// Journal (with its calendar), Insights and Settings under the floating tab bar.
+struct TabsRoot: View {
+    var zoom: Namespace.ID
+    @EnvironmentObject private var store: Store
+    @Environment(\.screen) private var screen
+
+    var body: some View {
+        ZStack {
+            Palette.canvas.ignoresSafeArea()
+            Group {
+                switch store.tab {
+                case .journal: JournalView(zoom: zoom)
+                case .insights: InsightsView()
+                case .settings: SettingsView()
+                }
             }
-            Spacer(minLength: 0)
+            .id(store.tab)
+            .transition(.asymmetric(insertion: .opacity.combined(with: .offset(y: 6)), removal: .opacity))
+
+            TabBar()
+                .padding(.bottom, max(0, screen.bottom(41) - screen.safeBottom))
+                .frame(maxHeight: .infinity, alignment: .bottom)
+                .ignoresSafeArea(.keyboard)
         }
     }
+}
 
-    private var recordAction: some View {
-        Button(action: store.startNewRecording) {
-            Label("Record a thought", systemImage: "mic.fill")
-                .font(.headline)
-                .frame(maxWidth: .infinity)
-                .frame(minHeight: 54)
+/// Covers the journal until Face ID (or the passcode) unlocks it.
+struct LockScreen: View {
+    @EnvironmentObject private var lock: AppLock
+    private let biometry = AppLock.biometry
+
+    var body: some View {
+        ZStack {
+            Palette.screen.ignoresSafeArea()
+            VStack(spacing: 18) {
+                Wordmark(size: 64)
+                GlyphView(glyph: .lock, size: 22, lineWidth: 2).foregroundStyle(Palette.ink2)
+                Text("Your journal is locked")
+                    .font(.sf(15))
+                    .foregroundStyle(Palette.ink2)
+            }
+            PrimaryButton(title: biometry == .none ? "Unlock" : "Unlock with \(biometry.name)", height: 52, weight: .medium) {
+                lock.unlock()
+            }
+            .padding(.horizontal, 28)
+            .padding(.bottom, 24)
+            .frame(maxHeight: .infinity, alignment: .bottom)
         }
-        .buttonStyle(.borderedProminent)
-        .buttonBorderShape(.roundedRectangle(radius: 18))
-        .tint(theme.accent)
-        .accessibilityHint("Starts a new voice journal entry")
-        .padding(.horizontal, 20)
-        .padding(.top, 12)
-        .padding(.bottom, 8)
-        .background(theme.bg.ignoresSafeArea())
-        .allowsHitTesting(!store.recordingOpen && store.detailEntry == nil)
-        .opacity(store.recordingOpen || store.detailEntry != nil ? 0 : 1)
+    }
+}
+
+/// Shown while Yap is in the app switcher, so entries never appear in its snapshot.
+struct PrivacyCover: View {
+    var body: some View {
+        ZStack {
+            Palette.screen
+            Wordmark(size: 64)
+        }
+        .ignoresSafeArea()
+    }
+}
+
+/// Keeps the edge-swipe back gesture working with the navigation bar hidden.
+extension UINavigationController: @retroactive UIGestureRecognizerDelegate {
+    override open func viewDidLoad() {
+        super.viewDidLoad()
+        interactivePopGestureRecognizer?.delegate = self
+    }
+
+    public func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        guard gestureRecognizer == interactivePopGestureRecognizer else { return true }
+        return viewControllers.count > 1 && NavigationGate.allowsPop
     }
 }

@@ -16,3 +16,6 @@ Yap/AI/Secrets.swift
 # Generated analysis output and screenshots from the superseded interface.
 graphify-out/
 screenshots/
+
+# XcodeGen-generated (widget extension)
+YapWidgets/Info.plist

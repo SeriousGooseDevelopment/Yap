@@ -2,9 +2,7 @@ import Foundation
 import AVFoundation
 
 /// Persists each recording as a compressed `.m4a` alongside its `JournalEntry`, plus a small
-/// downsampled waveform (peak amplitude per bucket, 0...1) for `DetailView`'s playback UI.
-/// Added as part of the design review's "prove the voice in the voice journal" fix — a voice
-/// journal's detail screen previously had zero visual trace that a recording ever happened.
+/// downsampled waveform (peak amplitude per bucket, 0...1) for the reading screen's player.
 enum EntryAudioStore {
     static let sampleRate: Double = 16000
 
@@ -19,10 +17,10 @@ enum EntryAudioStore {
         directory.appendingPathComponent("\(entryID).m4a")
     }
 
-    /// Writes the raw 16kHz mono Float32 samples captured for Whisper's final pass as AAC,
+    /// Writes the raw 16kHz mono Float32 samples captured while recording as AAC,
     /// and returns a downsampled waveform for display. Returns nil (no file written) if the
     /// clip is too short to be meaningful — callers should leave `JournalEntry.waveform` nil
-    /// in that case so `DetailView` hides the player rather than showing an empty one.
+    /// in that case so the reading screen hides the player rather than showing an empty one.
     @discardableResult
     static func save(samples: [Float], entryID: String, buckets: Int = 48) -> [Float]? {
         guard samples.count > Int(0.2 * sampleRate) else { return nil }
@@ -69,8 +67,8 @@ enum EntryAudioStore {
     }
 
     /// Decodes an entry's stored `.m4a` back to raw 16kHz mono Float32 samples — used when
-    /// "continuing" a note to concatenate its existing audio with the newly recorded
-    /// segment before re-saving under the same entry ID.
+    /// "Add voice" appends a new recording to an existing entry, so both are re-saved as
+    /// one clip under the same entry ID.
     static func loadSamples(entryID: String) -> [Float]? {
         let url = fileURL(for: entryID)
         guard FileManager.default.fileExists(atPath: url.path),
@@ -88,5 +86,20 @@ enum EntryAudioStore {
 
     static func delete(entryID: String) {
         try? FileManager.default.removeItem(at: fileURL(for: entryID))
+    }
+
+    static func deleteAll() {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    /// Resamples a stored waveform to `count` bars for display (max-pooling when shrinking,
+    /// nearest-neighbour when stretching).
+    static func bars(_ waveform: [Float], count: Int) -> [Float] {
+        guard !waveform.isEmpty, count > 0 else { return [] }
+        return (0..<count).map { i in
+            let lo = Int(Double(i) / Double(count) * Double(waveform.count))
+            let hi = max(lo + 1, Int(Double(i + 1) / Double(count) * Double(waveform.count)))
+            return waveform[min(lo, waveform.count - 1)..<min(hi, waveform.count)].max() ?? 0
+        }
     }
 }

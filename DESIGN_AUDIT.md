@@ -1,5 +1,8 @@
 # Yap — visual and interaction audit
 
+> Historical: this audit describes the paper-and-ink interface that `Yap Prototype.dc.html`
+> replaced. See `README.md` and `CLAUDE.md` for the current design.
+
 ## Executive assessment
 
 Yap has a clear product advantage: it turns spoken reflection into a private, editable

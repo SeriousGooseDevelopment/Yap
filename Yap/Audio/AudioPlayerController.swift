@@ -1,62 +1,92 @@
 import Foundation
 import AVFoundation
 
-/// Thin `AVAudioPlayer` wrapper backing `WaveformPlayer` in `DetailView`. Playback only —
-/// no editing/trimming, matching the design review's scoped ask.
+/// `AVAudioPlayer` wrapper behind the reading screen's player: play/pause, scrubbing,
+/// ±15s skips and the 1× / 1.5× / 2× / 0.75× speed cycle.
 @MainActor
 final class AudioPlayerController: NSObject, ObservableObject {
     @Published private(set) var isPlaying = false
-    /// 0...1
-    @Published private(set) var progress: Double = 0
+    /// Playback position in seconds.
+    @Published private(set) var time: Double = 0
+    @Published private(set) var duration: Double = 0
+    @Published private(set) var rate: Float = 1
+
+    static let rates: [Float] = [1, 1.5, 2, 0.75]
 
     private var player: AVAudioPlayer?
     private var timer: Timer?
-    private var loadedURL: URL?
 
-    func load(url: URL) {
-        guard loadedURL != url else { return }
-        loadedURL = url
+    var progress: Double { duration > 0 ? min(1, time / duration) : 0 }
+    var hasAudio: Bool { player != nil }
+
+    /// Always reopens the file: "Add voice" re-saves an entry's recording under the same URL.
+    func load(url: URL, fallbackDuration: Double) {
+        stop()
         player = try? AVAudioPlayer(contentsOf: url)
         player?.delegate = self
-        progress = 0
-        isPlaying = false
+        player?.enableRate = true
+        player?.rate = rate
+        player?.prepareToPlay()
+        duration = player?.duration ?? fallbackDuration
+        time = 0
     }
 
     func togglePlay() {
-        guard let player else { return }
-        if player.isPlaying {
-            player.pause()
-            isPlaying = false
-            stopTimer()
-        } else {
-            #if !os(macOS)
-            try? AVAudioSession.sharedInstance().setCategory(.playback)
-            try? AVAudioSession.sharedInstance().setActive(true)
-            #endif
-            player.play()
-            isPlaying = true
-            startTimer()
-        }
+        isPlaying ? pause() : play()
     }
 
-    func seek(toFraction fraction: Double) {
-        guard let player, player.duration > 0 else { return }
-        let clamped = max(0, min(1, fraction))
-        player.currentTime = clamped * player.duration
-        progress = clamped
+    func play() {
+        guard let player else { return }
+        #if os(iOS)
+        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .spokenAudio)
+        try? AVAudioSession.sharedInstance().setActive(true)
+        #endif
+        // Starting again from the very end replays from the top.
+        if player.currentTime >= player.duration - 0.2 { player.currentTime = 0 }
+        player.rate = rate
+        player.play()
+        isPlaying = true
+        startTimer()
+    }
+
+    func pause() {
+        player?.pause()
+        isPlaying = false
+        stopTimer()
+        tick()
+    }
+
+    func stop() {
+        player?.stop()
+        isPlaying = false
+        stopTimer()
+    }
+
+    func seek(to seconds: Double) {
+        guard let player else { return }
+        let clamped = max(0, min(player.duration, seconds))
+        player.currentTime = clamped
+        time = clamped
+    }
+
+    func skip(_ delta: Double) { seek(to: (player?.currentTime ?? time) + delta) }
+
+    func cycleRate() {
+        let index = Self.rates.firstIndex(of: rate) ?? 0
+        rate = Self.rates[(index + 1) % Self.rates.count]
+        player?.rate = rate
     }
 
     private func startTimer() {
         stopTimer()
         timer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            Task { @MainActor in self.tick() }
+            Task { @MainActor in self?.tick() }
         }
     }
 
     private func tick() {
-        guard let player, player.duration > 0 else { return }
-        progress = player.currentTime / player.duration
+        guard let player else { return }
+        time = player.currentTime
     }
 
     private func stopTimer() { timer?.invalidate(); timer = nil }
@@ -69,8 +99,8 @@ extension AudioPlayerController: AVAudioPlayerDelegate {
         Task { @MainActor [weak self] in
             guard let self else { return }
             self.isPlaying = false
-            self.progress = 0
             self.stopTimer()
+            self.time = self.duration
         }
     }
 }

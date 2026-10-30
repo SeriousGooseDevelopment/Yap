@@ -60,6 +60,8 @@ final class Transcriber: ObservableObject {
     /// recording when it fires, rather than leaving `recordingPhase` stuck at `.recording`
     /// with a dead tap.
     @Published private(set) var wasInterrupted = false
+    /// True between `pause()` and `resume()`: the engine is paused and nothing is captured.
+    @Published private(set) var isPaused = false
 
     private let engine = AVAudioEngine()
     private var recognizer: SFSpeechRecognizer?
@@ -70,6 +72,10 @@ final class Transcriber: ObservableObject {
     /// every update layers on top of this rather than replacing `liveText` outright —
     /// otherwise a pause-triggered restart would visibly wipe everything said so far.
     private var confirmedTextPrefix = ""
+    /// Bumped whenever a recognition task is replaced or abandoned. Late callbacks from an
+    /// older task (a final result arriving after `pause()` or a restart) are ignored, so
+    /// they can't append text that `confirmedTextPrefix` already holds.
+    private var taskGeneration = 0
     private let accumulator = AudioSampleAccumulator()
     private var levelTimer: Timer?
     private var interruptionObserver: NSObjectProtocol?
@@ -85,6 +91,7 @@ final class Transcriber: ObservableObject {
         liveText = ""
         confirmedTextPrefix = ""
         wasInterrupted = false
+        isPaused = false
         levels = Array(repeating: 0, count: 8)
         accumulator.reset()
 
@@ -119,9 +126,7 @@ final class Transcriber: ObservableObject {
         }
         #endif
 
-        let request = SFSpeechAudioBufferRecognitionRequest()
-        request.shouldReportPartialResults = true
-        request.requiresOnDeviceRecognition = true
+        let request = Self.makeRequest()
         recognitionRequest = request
 
         let inputNode = engine.inputNode
@@ -176,12 +181,24 @@ final class Transcriber: ObservableObject {
         return Array(UnsafeBufferPointer(start: channelData[0], count: Int(output.frameLength)))
     }
 
+    private static func makeRequest() -> SFSpeechAudioBufferRecognitionRequest {
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
+        request.requiresOnDeviceRecognition = true
+        // Sentence punctuation is what the writing screen splits paragraphs on.
+        request.addsPunctuation = true
+        return request
+    }
+
     /// Shared by the initial task and every restart so pause-triggered restarts keep
     /// working across an arbitrarily long recording, not just once.
     private func makeRecognitionTask(recognizer: SFSpeechRecognizer, request: SFSpeechAudioBufferRecognitionRequest) -> SFSpeechRecognitionTask {
-        recognizer.recognitionTask(with: request) { [weak self] result, error in
+        taskGeneration += 1
+        let generation = taskGeneration
+        return recognizer.recognitionTask(with: request) { [weak self] result, error in
             guard let self else { return }
             Task { @MainActor in
+                guard generation == self.taskGeneration else { return }
                 if let result {
                     self.updateLiveText(with: result.bestTranscription.formattedString)
                 }
@@ -216,11 +233,59 @@ final class Transcriber: ObservableObject {
         confirmedTextPrefix = liveText
         recognitionTask?.cancel()
         recognitionRequest?.endAudio()
-        let request = SFSpeechAudioBufferRecognitionRequest()
-        request.shouldReportPartialResults = true
-        request.requiresOnDeviceRecognition = true
+        let request = Self.makeRequest()
         recognitionRequest = request
         recognitionTask = makeRecognitionTask(recognizer: recognizer, request: request)
+    }
+
+    #if DEBUG
+    /// Screenshot hook (`-recordingTranscript`): shows text without a live recognizer.
+    func debugShow(_ text: String) { liveText = text }
+    #endif
+
+    // MARK: - Pause / resume
+
+    /// Pauses capture without ending the recording. The current recognition request is
+    /// closed out (so a long pause can't run into the recognizer's own time limit) and
+    /// `resume()` starts a fresh one layered on everything said so far.
+    func pause() {
+        guard !isPaused, engine.isRunning else { return }
+        engine.pause()
+        levelTimer?.invalidate()
+        levelTimer = nil
+        levels = Array(repeating: 0, count: 8)
+        confirmedTextPrefix = liveText
+        taskGeneration += 1
+        let task = recognitionTask
+        recognitionTask = nil
+        recognitionRequest?.endAudio()
+        recognitionRequest = nil
+        task?.cancel()
+        isPaused = true
+    }
+
+    func resume() {
+        guard isPaused, let recognizer else { return }
+        let request = Self.makeRequest()
+        recognitionRequest = request
+        recognitionTask = makeRecognitionTask(recognizer: recognizer, request: request)
+        do {
+            try engine.start()
+        } catch {
+            wasInterrupted = true
+            return
+        }
+        startLevelTimer()
+        isPaused = false
+    }
+
+    /// The active input's name for the recorder's "Input" menu row, e.g. "iPhone Microphone".
+    var inputName: String {
+        #if os(iOS)
+        return AVAudioSession.sharedInstance().currentRoute.inputs.first?.portName ?? "Microphone"
+        #else
+        return "Microphone"
+        #endif
     }
 
     private func startLevelTimer() {
@@ -243,7 +308,12 @@ final class Transcriber: ObservableObject {
         levelTimer?.invalidate()
         levelTimer = nil
         engine.inputNode.removeTap(onBus: 0)
-        if engine.isRunning { engine.stop() }
+        // Also covers a paused engine, which reports `isRunning == false` but still holds the input.
+        engine.stop()
+        #if os(iOS)
+        // Lets audio that was ducked for the recording come back up.
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        #endif
     }
 
     // MARK: - Stop / final result
@@ -257,6 +327,8 @@ final class Transcriber: ObservableObject {
     /// `lastRecordedSamples` for playback — only the live *text* stops updating here.
     func stopAndTranscribeFinal() async -> String {
         let text = liveText
+        taskGeneration += 1
+        isPaused = false
         recognitionTask?.cancel()
         recognitionRequest = nil
         recognitionTask = nil
@@ -266,6 +338,8 @@ final class Transcriber: ObservableObject {
     }
 
     func cancelRecording() {
+        taskGeneration += 1
+        isPaused = false
         recognitionRequest?.endAudio()
         recognitionTask?.cancel()
         recognitionRequest = nil
